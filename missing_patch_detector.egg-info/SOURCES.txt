@@ -1,0 +1,15 @@
+pyproject.toml
+missing_patch_detector/__init__.py
+missing_patch_detector/patch_collector.py
+missing_patch_detector/patch_presence_detector.py
+missing_patch_detector/pipeline.py
+missing_patch_detector/repo_scanner.py
+missing_patch_detector.egg-info/PKG-INFO
+missing_patch_detector.egg-info/SOURCES.txt
+missing_patch_detector.egg-info/dependency_links.txt
+missing_patch_detector.egg-info/requires.txt
+missing_patch_detector.egg-info/top_level.txt
+tests/test_patch_collector.py
+tests/test_patch_presence_detector.py
+tests/test_pipeline.py
+tests/test_repo_scanner.py
