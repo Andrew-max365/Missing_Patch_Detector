@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from .patch_collector import DiffFileData
+from .repo_scanner import RepoScanner
+
+
+@dataclass(slots=True)
+class PatchPresenceResult:
+    """Result of checking whether a patch is applied on a single branch."""
+
+    branch: str
+    patch_applied: bool
+    matched_files: list[str]
+    missing_files: list[str]
+    confidence: float
+
+
+class PatchPresenceDetector:
+    """Check whether a parsed patch is present in each branch of a repository.
+
+    Detection strategy
+    ------------------
+    For every file touched by the patch, the corresponding source file on the
+    branch is read.  Each *added* line from the patch is looked up (stripped) in
+    the set of stripped source lines.  The ratio of matched added lines gives a
+    per-file confidence score.  A file is considered patched when that ratio is
+    at or above ``match_threshold`` (default 0.8).  A branch is considered fully
+    patched only when *all* patch files pass the threshold.
+    """
+
+    def __init__(self, match_threshold: float = 0.8) -> None:
+        if not (0.0 <= match_threshold <= 1.0):
+            raise ValueError("match_threshold must be between 0.0 and 1.0")
+        self.match_threshold = match_threshold
+
+    # ------------------------------------------------------------------
+    # Per-file helpers
+    # ------------------------------------------------------------------
+
+    def is_patch_applied_to_file(
+        self, diff_data: DiffFileData, source_code: str
+    ) -> tuple[bool, float]:
+        """Return *(applied, confidence)* for a single file.
+
+        *confidence* is the fraction of the patch's added lines that appear
+        (stripped) in *source_code*.  When the patch adds no lines the file is
+        trivially considered patched (confidence = 1.0).
+        """
+        added_lines = diff_data.added_lines
+        if not added_lines:
+            return True, 1.0
+
+        source_line_set = {line.strip() for line in source_code.splitlines()}
+        matched = sum(
+            1 for line in added_lines if line.strip() in source_line_set
+        )
+        confidence = matched / len(added_lines)
+        return confidence >= self.match_threshold, confidence
+
+    # ------------------------------------------------------------------
+    # Branch-level check
+    # ------------------------------------------------------------------
+
+    def check_branch(
+        self,
+        diff_files: list[DiffFileData],
+        branch: str,
+        scanner: RepoScanner,
+    ) -> PatchPresenceResult:
+        """Check whether all files in *diff_files* are patched on *branch*.
+
+        Uses *scanner* to read each relevant file on the branch.  Files that
+        cannot be located are treated as unpatched.
+        """
+        matched_files: list[str] = []
+        missing_files: list[str] = []
+        confidence_scores: list[float] = []
+
+        for diff_data in diff_files:
+            snapshot = scanner.checkout_and_read(branch, diff_data.file_path)
+
+            if snapshot.source_code is None:
+                missing_files.append(diff_data.file_path)
+                confidence_scores.append(0.0)
+                continue
+
+            applied, confidence = self.is_patch_applied_to_file(
+                diff_data, snapshot.source_code
+            )
+            confidence_scores.append(confidence)
+            if applied:
+                matched_files.append(diff_data.file_path)
+            else:
+                missing_files.append(diff_data.file_path)
+
+        avg_confidence = (
+            sum(confidence_scores) / len(confidence_scores)
+            if confidence_scores
+            else 0.0
+        )
+        patch_applied = len(missing_files) == 0
+
+        return PatchPresenceResult(
+            branch=branch,
+            patch_applied=patch_applied,
+            matched_files=matched_files,
+            missing_files=missing_files,
+            confidence=avg_confidence,
+        )
