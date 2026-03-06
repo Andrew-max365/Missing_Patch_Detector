@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 from git import Repo
-from git.exc import GitCommandError, InvalidGitRepositoryError, NoSuchPathError
+from git.objects import Blob, Tree
+from git.exc import BadName, GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 
 
 class RepoScannerError(Exception):
@@ -24,8 +26,29 @@ class BranchFileSnapshot:
 class RepoScanner:
     """Initialize repositories, enumerate active branches, and read source files."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_blob_bytes: int = 5 * 1024 * 1024) -> None:
         self.repo: Repo | None = None
+        self.max_blob_bytes = max_blob_bytes
+
+    def clone_for_worker(self) -> "RepoScanner":
+        """Create a scanner instance for one worker thread.
+
+        Subclasses can override this to preserve custom constructor arguments
+        or runtime configuration while keeping per-thread scanner isolation.
+        """
+        try:
+            return type(self)(max_blob_bytes=self.max_blob_bytes)
+        except TypeError:
+            worker = type(self)()
+            if hasattr(worker, "max_blob_bytes"):
+                worker.max_blob_bytes = self.max_blob_bytes
+            return worker
+
+    def create_worker_scanner(self, repo_url: str, local_path: str) -> "RepoScanner":
+        """Build and initialize a thread-local scanner instance."""
+        worker = self.clone_for_worker()
+        worker.init_repo(repo_url, local_path)
+        return worker
 
     def init_repo(self, repo_url: str, local_path: str) -> Repo:
         repo_path = Path(local_path)
@@ -66,26 +89,42 @@ class RepoScanner:
         return sorted(set(branches))
 
     def checkout_and_read(self, branch_name: str, file_path: str) -> BranchFileSnapshot:
+        """Read *file_path* from *branch_name* without mutating worktree state.
+
+        Historically this method checked out each branch and then read files from disk.
+        That approach is correct but too slow when scanning many branches and cannot be
+        safely parallelised on one repository checkout.  The implementation now reads
+        directly from the branch commit tree (Git object database), so it remains
+        backward compatible while enabling concurrent branch scanning.
+        """
         if self.repo is None:
             raise RepoScannerError("Repository not initialized")
 
         try:
-            self.repo.git.checkout(branch_name)
-        except GitCommandError as exc:
-            raise RepoScannerError(f"Failed to checkout branch {branch_name}: {exc}") from exc
+            commit = self.repo.commit(branch_name)
+        except (ValueError, GitCommandError, BadName) as exc:
+            raise RepoScannerError(f"Failed to resolve branch {branch_name}: {exc}") from exc
 
-        repo_root = Path(self.repo.working_tree_dir or ".")
-        target = repo_root / file_path
-        if target.exists():
+        source_code, too_large = self._read_blob_text(commit.tree, file_path)
+        if source_code is not None:
             return BranchFileSnapshot(
                 branch=branch_name,
                 requested_path=file_path,
                 resolved_path=file_path,
-                source_code=target.read_text(encoding="utf-8", errors="ignore"),
+                source_code=source_code,
                 status="found",
             )
 
-        resolved = self._best_effort_locate(repo_root, file_path)
+        if too_large:
+            return BranchFileSnapshot(
+                branch=branch_name,
+                requested_path=file_path,
+                resolved_path=file_path,
+                source_code=None,
+                status="too_large",
+            )
+
+        resolved = self._best_effort_locate_in_tree(commit.tree, file_path)
         if resolved is None:
             return BranchFileSnapshot(
                 branch=branch_name,
@@ -98,8 +137,8 @@ class RepoScanner:
         return BranchFileSnapshot(
             branch=branch_name,
             requested_path=file_path,
-            resolved_path=str(resolved.relative_to(repo_root)),
-            source_code=resolved.read_text(encoding="utf-8", errors="ignore"),
+            resolved_path=resolved,
+            source_code=self._read_blob_text(commit.tree, resolved)[0],
             status="renamed_or_moved",
         )
 
@@ -112,3 +151,42 @@ class RepoScanner:
         # Prefer shortest path depth as a simple heuristic.
         candidates.sort(key=lambda p: len(p.parts))
         return candidates[0]
+
+    def _read_blob_text(self, tree: Tree, file_path: str) -> tuple[str | None, bool]:
+        """Return UTF-8 text for *file_path* in *tree* when present.
+
+        Returns a tuple of ``(content, too_large)`` where ``too_large`` indicates
+        the blob exists but exceeded ``max_blob_bytes`` and was skipped.
+        """
+        try:
+            obj = tree / file_path
+        except KeyError:
+            return None, False
+
+        if not isinstance(obj, Blob):
+            return None, False
+        if obj.size > self.max_blob_bytes:
+            return None, True
+        return obj.data_stream.read().decode("utf-8", errors="ignore"), False
+
+    def _best_effort_locate_in_tree(self, tree: Tree, original_path: str) -> str | None:
+        """Fallback lookup for renamed/moved files by filename within one commit tree."""
+        original_name = Path(original_path).name
+        matches: list[str] = []
+
+        stack: list[tuple[str, Tree]] = [("", tree)]
+        while stack:
+            prefix, current_tree = stack.pop()
+            for item in current_tree:
+                item_path = f"{prefix}{item.name}" if not prefix else f"{prefix}/{item.name}"
+                if isinstance(item, Tree):
+                    stack.append((item_path, cast(Tree, item)))
+                    continue
+                if isinstance(item, Blob) and Path(item_path).name == original_name:
+                    matches.append(item_path)
+
+        if not matches:
+            return None
+
+        matches.sort(key=lambda p: len(Path(p).parts))
+        return matches[0]

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
 from .cve_resolver import CommitRef, CVEResolver
-from .patch_collector import PatchCollector
+from .patch_collector import DiffFileData, PatchCollector
 from .patch_presence_detector import PatchPresenceDetector, PatchPresenceResult
 from .repo_scanner import RepoScanner
 
@@ -34,6 +35,7 @@ class DetectionReport:
     patched_branches: list[str]
     missing_branches: list[str]
     branch_results: list[PatchPresenceResult] = field(default_factory=list)
+    scan_errors: dict[str, str] = field(default_factory=dict)
     cve_id: str | None = None
     commit_url: str | None = None
     generated_at: str = field(
@@ -60,7 +62,9 @@ class DetectionReport:
                 "patched_branches": self.patched_branches,
                 "missing_branches": self.missing_branches,
                 "total_branches_scanned": len(self.branch_results),
+                "scan_errors": len(self.scan_errors),
             },
+            "scan_errors": self.scan_errors,
             "branch_results": [
                 {
                     "branch": r.branch,
@@ -106,6 +110,7 @@ class DetectionReport:
         lines.append(f"| Branches scanned | {total} |")
         lines.append(f"| ✅ Patched | {patched_count} |")
         lines.append(f"| ❌ Missing patch | {missing_count} |")
+        lines.append(f"| ⚠️ Branch scan errors | {len(self.scan_errors)} |")
         lines.append("")
 
         lines.append("### Branch Results")
@@ -120,6 +125,13 @@ class DetectionReport:
                 f"| `{r.branch}` | {status} | {r.confidence:.2f} | {llm} | {missing} |"
             )
         lines.append("")
+
+        if self.scan_errors:
+            lines.append("### ⚠️ Branch Scan Errors")
+            lines.append("")
+            for branch, error in sorted(self.scan_errors.items()):
+                lines.append(f"- `{branch}`: {error}")
+            lines.append("")
 
         if self.missing_branches:
             lines.append("### ⚠️ Branches Missing the Patch")
@@ -189,6 +201,7 @@ class MissingPatchPipeline:
         max_age_days: int = 365,
         include_local_branches: bool = True,
         cve_id: str | None = None,
+        max_workers: int | None = None,
     ) -> DetectionReport:
         """Run the full detection pipeline and return a :class:`DetectionReport`.
 
@@ -209,6 +222,9 @@ class MissingPatchPipeline:
             evaluated.
         cve_id:
             Optional CVE identifier to attach to the report for traceability.
+        max_workers:
+            Number of worker threads used for branch-level scanning. Defaults to
+            ``min(32, len(branches))`` when scanning multiple branches.
         """
         # 1. Download and parse the upstream patch
         patch_text = self.collector.download_patch(commit_url)
@@ -225,9 +241,43 @@ class MissingPatchPipeline:
 
         # 4. Check each branch for patch presence
         branch_results: list[PatchPresenceResult] = []
-        for branch in branches:
-            result = self.detector.check_branch(diff_files, branch, self.scanner)
-            branch_results.append(result)
+        scan_errors: dict[str, str] = {}
+
+        if not branches:
+            branch_results = []
+        elif len(branches) == 1:
+            branch = branches[0]
+            try:
+                branch_results = [
+                    self.detector.check_branch(diff_files, branch, self.scanner)
+                ]
+            except Exception as exc:
+                scan_errors[branch] = str(exc)
+                branch_results = [self._build_failed_branch_result(branch, diff_files)]
+        else:
+            worker_count = max_workers or min(32, len(branches))
+            ordered_results: dict[str, PatchPresenceResult] = {}
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(
+                        self._scan_branch_with_isolated_scanner,
+                        diff_files,
+                        branch,
+                        repo_url,
+                        local_path,
+                    ): branch
+                    for branch in branches
+                }
+                for future in as_completed(futures):
+                    branch = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        scan_errors[branch] = str(exc)
+                        result = self._build_failed_branch_result(branch, diff_files)
+                    ordered_results[branch] = result
+
+            branch_results = [ordered_results[branch] for branch in branches]
 
         patched = [r.branch for r in branch_results if r.patch_applied]
         missing = [r.branch for r in branch_results if not r.patch_applied]
@@ -236,8 +286,37 @@ class MissingPatchPipeline:
             patched_branches=patched,
             missing_branches=missing,
             branch_results=branch_results,
+            scan_errors=scan_errors,
             cve_id=cve_id,
             commit_url=commit_url,
+        )
+
+
+    def _scan_branch_with_isolated_scanner(
+        self,
+        diff_files: list[DiffFileData],
+        branch: str,
+        repo_url: str,
+        local_path: str,
+    ) -> PatchPresenceResult:
+        """Scan one branch using an isolated scanner instance for thread safety."""
+        worker_scanner = self.scanner.create_worker_scanner(repo_url, local_path)
+        return self.detector.check_branch(diff_files, branch, worker_scanner)
+
+    def _build_failed_branch_result(
+        self,
+        branch: str,
+        diff_files: list[DiffFileData],
+    ) -> PatchPresenceResult:
+        """Create a conservative result when a branch scan errors out."""
+        missing_files = [diff.file_path for diff in diff_files]
+        return PatchPresenceResult(
+            branch=branch,
+            patch_applied=False,
+            matched_files=[],
+            missing_files=missing_files,
+            confidence=0.0,
+            llm_assisted=False,
         )
 
     def run_for_cve(
