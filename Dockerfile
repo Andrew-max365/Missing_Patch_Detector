@@ -16,7 +16,10 @@ COPY missing_patch_detector ./missing_patch_detector
 RUN pip install --upgrade pip \
     && pip install .
 
-RUN useradd -m appuser
+RUN useradd -m appuser \
+    && mkdir -p /data/repos /data/reports \
+    && chown -R appuser:appuser /data/repos /data/reports
+
 USER appuser
 
 # Runtime volumes (mounted by docker-compose)

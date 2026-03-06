@@ -260,10 +260,10 @@ def test_llm_fallback_no_when_llm_says_no(tmp_path: Path) -> None:
     assert "app.py" in result.missing_files
 
 
-def test_llm_threshold_not_triggered_when_confidence_above_llm_threshold(
+def test_llm_always_invoked_when_text_match_fails(
     tmp_path: Path,
 ) -> None:
-    """Even if text match fails, LLM is only invoked when confidence < llm_threshold."""
+    """LLM is invoked whenever text matching fails, regardless of confidence level."""
     # Partial match: confidence will be 0.5 (one of two lines matches)
     partial_source = "if size < 0:\n    return 0\n"
     repo = Repo.init(tmp_path / "repo")
@@ -280,8 +280,8 @@ def test_llm_threshold_not_triggered_when_confidence_above_llm_threshold(
         llm_called.append(True)
         return "YES"
 
-    # llm_threshold=0.4 means LLM fires only when confidence < 0.4
-    # confidence here is 0.5, so LLM should NOT fire
+    # Even though confidence (0.5) is above llm_threshold (0.4), the LLM must
+    # now be consulted because text matching failed (confidence < match_threshold).
     detector = PatchPresenceDetector(
         match_threshold=1.0,  # strict – partial match fails
         llm_summarizer=fake_llm,
@@ -289,9 +289,10 @@ def test_llm_threshold_not_triggered_when_confidence_above_llm_threshold(
     )
     result = detector.check_branch([DIFF_DATA], "master", scanner)
 
-    # Text matching fails, but LLM was not consulted (confidence >= llm_threshold)
-    assert result.patch_applied is False
-    assert llm_called == []
+    # LLM should be consulted and its YES verdict accepted
+    assert result.patch_applied is True
+    assert result.llm_assisted is True
+    assert llm_called == [True]
 
 
 def test_invalid_llm_threshold_raises() -> None:
