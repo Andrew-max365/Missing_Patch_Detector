@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .patch_collector import DiffFileData
 from .repo_scanner import RepoScanner
@@ -15,6 +16,7 @@ class PatchPresenceResult:
     matched_files: list[str]
     missing_files: list[str]
     confidence: float
+    llm_assisted: bool = False
 
 
 class PatchPresenceDetector:
@@ -28,12 +30,29 @@ class PatchPresenceDetector:
     per-file confidence score.  A file is considered patched when that ratio is
     at or above ``match_threshold`` (default 0.8).  A branch is considered fully
     patched only when *all* patch files pass the threshold.
+
+    LLM fallback (Phase 2)
+    ----------------------
+    When *llm_summarizer* is provided and text-matching confidence falls below
+    ``llm_threshold``, the detector sends the patch diff and the relevant source
+    code to the LLM callback for a semantic verdict.  The callback must accept a
+    ``str`` prompt and return ``"YES"`` or ``"NO"`` (case-insensitive) optionally
+    followed by an explanation.
     """
 
-    def __init__(self, match_threshold: float = 0.8) -> None:
+    def __init__(
+        self,
+        match_threshold: float = 0.8,
+        llm_summarizer: Callable[[str], str] | None = None,
+        llm_threshold: float = 0.5,
+    ) -> None:
         if not (0.0 <= match_threshold <= 1.0):
             raise ValueError("match_threshold must be between 0.0 and 1.0")
+        if not (0.0 <= llm_threshold <= 1.0):
+            raise ValueError("llm_threshold must be between 0.0 and 1.0")
         self.match_threshold = match_threshold
+        self.llm_summarizer = llm_summarizer
+        self.llm_threshold = llm_threshold
 
     # ------------------------------------------------------------------
     # Per-file helpers
@@ -59,6 +78,36 @@ class PatchPresenceDetector:
         confidence = matched / len(added_lines)
         return confidence >= self.match_threshold, confidence
 
+    def _ask_llm_for_file(
+        self, diff_data: DiffFileData, source_code: str
+    ) -> bool:
+        """Use the LLM callback to decide whether a patch is applied to a file.
+
+        Sends a structured prompt containing the patch diff and the current
+        source and expects a ``"YES"`` / ``"NO"`` answer.  Returns ``True`` if
+        the LLM answer starts with ``"yes"`` (case-insensitive).
+        """
+        assert self.llm_summarizer is not None  # caller's responsibility
+
+        diff_section = (
+            f"File: {diff_data.file_path}\n"
+            f"Added lines:\n" + "\n".join(diff_data.added_lines[:80]) + "\n"
+            f"Removed lines:\n" + "\n".join(diff_data.removed_lines[:80]) + "\n"
+        )
+        source_section = f"Current source:\n{source_code[:3000]}\n"
+
+        prompt = (
+            "You are a security patch analyst.\n"
+            "Determine whether the following security patch has already been applied "
+            "to the source code shown below.\n"
+            "Answer exactly 'YES' if the patch is applied or 'NO' if it is missing, "
+            "followed by a one-sentence explanation.\n\n"
+            f"=== PATCH ===\n{diff_section}\n"
+            f"=== SOURCE ===\n{source_section}"
+        )
+        answer = self.llm_summarizer(prompt)
+        return answer.strip().upper().startswith("YES")
+
     # ------------------------------------------------------------------
     # Branch-level check
     # ------------------------------------------------------------------
@@ -73,10 +122,14 @@ class PatchPresenceDetector:
 
         Uses *scanner* to read each relevant file on the branch.  Files that
         cannot be located are treated as unpatched.
+
+        When a ``llm_summarizer`` was provided and text-matching confidence is
+        below ``llm_threshold``, the LLM is queried as a fallback for that file.
         """
         matched_files: list[str] = []
         missing_files: list[str] = []
         confidence_scores: list[float] = []
+        llm_assisted = False
 
         for diff_data in diff_files:
             snapshot = scanner.checkout_and_read(branch, diff_data.file_path)
@@ -89,6 +142,15 @@ class PatchPresenceDetector:
             applied, confidence = self.is_patch_applied_to_file(
                 diff_data, snapshot.source_code
             )
+
+            # LLM fallback: if text matching is inconclusive and a summarizer is available
+            if not applied and self.llm_summarizer is not None and confidence < self.llm_threshold:
+                applied = self._ask_llm_for_file(diff_data, snapshot.source_code)
+                llm_assisted = True
+                # Treat LLM confirmation as high-confidence
+                if applied:
+                    confidence = max(confidence, self.match_threshold)
+
             confidence_scores.append(confidence)
             if applied:
                 matched_files.append(diff_data.file_path)
@@ -108,4 +170,5 @@ class PatchPresenceDetector:
             matched_files=matched_files,
             missing_files=missing_files,
             confidence=avg_confidence,
+            llm_assisted=llm_assisted,
         )

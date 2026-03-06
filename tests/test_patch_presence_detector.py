@@ -185,3 +185,127 @@ def test_check_branch_multiple_files(tmp_path: Path) -> None:
     assert result.patch_applied is False
     assert "app.py" in result.matched_files
     assert "util.py" in result.missing_files
+
+
+# ---------------------------------------------------------------------------
+# LLM fallback tests (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_fallback_invoked_when_confidence_low(tmp_path: Path) -> None:
+    """LLM is called when text confidence < llm_threshold and patch not text-matched."""
+    _make_repo(tmp_path / "repo", UNPATCHED_SOURCE)
+    scanner = RepoScanner()
+    scanner.init_repo(str(tmp_path / "repo"), str(tmp_path / "repo"))
+
+    prompts_seen: list[str] = []
+
+    def fake_llm(prompt: str) -> str:
+        prompts_seen.append(prompt)
+        return "YES – the patch guards are already present semantically"
+
+    detector = PatchPresenceDetector(
+        match_threshold=0.8,
+        llm_summarizer=fake_llm,
+        llm_threshold=0.5,
+    )
+    result = detector.check_branch([DIFF_DATA], "master", scanner)
+
+    assert result.patch_applied is True
+    assert result.llm_assisted is True
+    assert len(prompts_seen) == 1
+    assert "app.py" in prompts_seen[0]
+    assert "PATCH" in prompts_seen[0]
+
+
+def test_llm_fallback_not_invoked_when_confidence_above_threshold(tmp_path: Path) -> None:
+    """LLM must NOT be called when text confidence already meets match_threshold."""
+    _make_repo(tmp_path / "repo", PATCHED_SOURCE)
+    scanner = RepoScanner()
+    scanner.init_repo(str(tmp_path / "repo"), str(tmp_path / "repo"))
+
+    llm_called: list[bool] = []
+
+    def fake_llm(prompt: str) -> str:
+        llm_called.append(True)
+        return "YES"
+
+    detector = PatchPresenceDetector(
+        match_threshold=0.8,
+        llm_summarizer=fake_llm,
+        llm_threshold=0.5,
+    )
+    result = detector.check_branch([DIFF_DATA], "master", scanner)
+
+    assert result.patch_applied is True
+    assert result.llm_assisted is False
+    assert llm_called == []
+
+
+def test_llm_fallback_no_when_llm_says_no(tmp_path: Path) -> None:
+    """If LLM says NO, the file should remain marked as missing."""
+    _make_repo(tmp_path / "repo", UNPATCHED_SOURCE)
+    scanner = RepoScanner()
+    scanner.init_repo(str(tmp_path / "repo"), str(tmp_path / "repo"))
+
+    detector = PatchPresenceDetector(
+        match_threshold=0.8,
+        llm_summarizer=lambda _: "NO – the guard is not present",
+        llm_threshold=0.5,
+    )
+    result = detector.check_branch([DIFF_DATA], "master", scanner)
+
+    assert result.patch_applied is False
+    assert result.llm_assisted is True
+    assert "app.py" in result.missing_files
+
+
+def test_llm_threshold_not_triggered_when_confidence_above_llm_threshold(
+    tmp_path: Path,
+) -> None:
+    """Even if text match fails, LLM is only invoked when confidence < llm_threshold."""
+    # Partial match: confidence will be 0.5 (one of two lines matches)
+    partial_source = "if size < 0:\n    return 0\n"
+    repo = Repo.init(tmp_path / "repo")
+    (tmp_path / "repo" / "app.py").write_text(partial_source, encoding="utf-8")
+    repo.index.add(["app.py"])
+    repo.index.commit("partial")
+
+    scanner = RepoScanner()
+    scanner.init_repo(str(tmp_path / "repo"), str(tmp_path / "repo"))
+
+    llm_called: list[bool] = []
+
+    def fake_llm(prompt: str) -> str:
+        llm_called.append(True)
+        return "YES"
+
+    # llm_threshold=0.4 means LLM fires only when confidence < 0.4
+    # confidence here is 0.5, so LLM should NOT fire
+    detector = PatchPresenceDetector(
+        match_threshold=1.0,  # strict – partial match fails
+        llm_summarizer=fake_llm,
+        llm_threshold=0.4,
+    )
+    result = detector.check_branch([DIFF_DATA], "master", scanner)
+
+    # Text matching fails, but LLM was not consulted (confidence >= llm_threshold)
+    assert result.patch_applied is False
+    assert llm_called == []
+
+
+def test_invalid_llm_threshold_raises() -> None:
+    with pytest.raises(ValueError, match="llm_threshold"):
+        PatchPresenceDetector(llm_threshold=-0.1)
+
+
+def test_llm_assisted_false_when_no_llm_summarizer(tmp_path: Path) -> None:
+    """Without a summarizer, llm_assisted must always be False."""
+    _make_repo(tmp_path / "repo", UNPATCHED_SOURCE)
+    scanner = RepoScanner()
+    scanner.init_repo(str(tmp_path / "repo"), str(tmp_path / "repo"))
+
+    detector = PatchPresenceDetector()
+    result = detector.check_branch([DIFF_DATA], "master", scanner)
+
+    assert result.llm_assisted is False
