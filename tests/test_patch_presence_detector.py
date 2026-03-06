@@ -309,3 +309,30 @@ def test_llm_assisted_false_when_no_llm_summarizer(tmp_path: Path) -> None:
     result = detector.check_branch([DIFF_DATA], "master", scanner)
 
     assert result.llm_assisted is False
+
+
+def test_llm_retry_on_transient_failure(tmp_path: Path) -> None:
+    _make_repo(tmp_path / "repo", UNPATCHED_SOURCE)
+    scanner = RepoScanner()
+    scanner.init_repo(str(tmp_path / "repo"), str(tmp_path / "repo"))
+
+    attempts = {"count": 0}
+
+    def flaky_llm(_: str) -> str:
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise RuntimeError("429")
+        return "YES"
+
+    detector = PatchPresenceDetector(
+        llm_summarizer=flaky_llm,
+        llm_threshold=1.0,
+        llm_max_retries=3,
+        llm_initial_backoff=0.001,
+    )
+
+    result = detector.check_branch([DIFF_DATA], "master", scanner)
+
+    assert result.patch_applied is True
+    assert result.llm_assisted is True
+    assert attempts["count"] == 3

@@ -57,3 +57,30 @@ def test_get_active_branches_for_local_repo(tmp_path: Path) -> None:
     branches = scanner.get_active_branches(include_local=True)
     assert "master" in branches
     assert "legacy" in branches
+
+
+def test_create_worker_scanner_preserves_configuration(tmp_path: Path) -> None:
+    local_repo = tmp_path / "demo"
+    _init_demo_repo(local_repo)
+
+    scanner = RepoScanner(max_blob_bytes=1024)
+    worker = scanner.create_worker_scanner(str(local_repo), str(local_repo))
+
+    assert isinstance(worker, RepoScanner)
+    assert worker is not scanner
+    assert worker.max_blob_bytes == 1024
+
+
+def test_checkout_and_read_skips_too_large_blob(tmp_path: Path) -> None:
+    repo_path = tmp_path / "demo"
+    repo = Repo.init(repo_path)
+    (repo_path / "huge.txt").write_text("A" * 100, encoding="utf-8")
+    repo.index.add(["huge.txt"])
+    repo.index.commit("add huge")
+
+    scanner = RepoScanner(max_blob_bytes=10)
+    scanner.init_repo(str(repo_path), str(repo_path))
+
+    snapshot = scanner.checkout_and_read("master", "huge.txt")
+    assert snapshot.status == "too_large"
+    assert snapshot.source_code is None

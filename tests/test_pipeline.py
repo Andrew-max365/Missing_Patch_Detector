@@ -20,6 +20,18 @@ from missing_patch_detector.pipeline import DetectionReport, MissingPatchPipelin
 from missing_patch_detector.repo_scanner import RepoScanner
 
 
+class CustomRepoScanner(RepoScanner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.worker_created = False
+
+    def create_worker_scanner(self, repo_url: str, local_path: str) -> "RepoScanner":
+        self.worker_created = True
+        worker = CustomRepoScanner()
+        worker.init_repo(repo_url, local_path)
+        return worker
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -220,6 +232,90 @@ def test_pipeline_run_preserves_branch_order_with_parallel_scan() -> None:
     assert report.patched_branches == ["release/2.0", "main"]
     assert report.missing_branches == ["release/1.0"]
 
+
+
+
+def test_pipeline_parallel_scan_handles_branch_error_without_aborting() -> None:
+    mock_collector = MagicMock(spec=PatchCollector)
+    mock_scanner = MagicMock(spec=RepoScanner)
+    mock_detector = MagicMock(spec=PatchPresenceDetector)
+
+    diff = DiffFileData(
+        file_path="f.py",
+        source_file="a/f.py",
+        target_file="b/f.py",
+        removed_lines=[],
+        added_lines=["x = 1"],
+        context_lines=[],
+    )
+
+    branches = ["ok-1", "broken", "ok-2"]
+    mock_collector.download_patch.return_value = "raw patch"
+    mock_collector.parse_diff.return_value = [diff]
+    mock_scanner.get_active_branches.return_value = branches
+    mock_scanner.create_worker_scanner.return_value = mock_scanner
+
+    def side_effect(_diff_files: list[DiffFileData], branch: str, _scanner: RepoScanner) -> PatchPresenceResult:
+        if branch == "broken":
+            raise RuntimeError("simulated scanner failure")
+        return PatchPresenceResult(
+            branch=branch,
+            patch_applied=True,
+            matched_files=["f.py"],
+            missing_files=[],
+            confidence=1.0,
+        )
+
+    mock_detector.check_branch.side_effect = side_effect
+
+    pipeline = MissingPatchPipeline(
+        collector=mock_collector,
+        scanner=mock_scanner,
+        detector=mock_detector,
+    )
+    report = pipeline.run(
+        commit_url="https://example.com/commit/xyz",
+        repo_url="https://example.com/repo.git",
+        local_path="/tmp/repo",
+        max_workers=3,
+    )
+
+    assert [r.branch for r in report.branch_results] == branches
+    assert report.scan_errors["broken"] == "simulated scanner failure"
+    assert "broken" in report.missing_branches
+    assert "ok-1" in report.patched_branches
+
+
+def test_pipeline_parallel_scan_uses_custom_scanner_worker_factory(tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo"
+    _make_two_branch_repo(repo_path)
+
+    mock_collector = MagicMock(spec=PatchCollector)
+    mock_collector.download_patch.return_value = SAMPLE_PATCH
+    mock_collector.parse_diff.return_value = [
+        DiffFileData(
+            file_path="app.py",
+            source_file="a/app.py",
+            target_file="b/app.py",
+            removed_lines=[],
+            added_lines=['if size < 0:', '    raise ValueError("invalid size")'],
+            context_lines=[],
+        )
+    ]
+
+    scanner = CustomRepoScanner()
+    detector = PatchPresenceDetector()
+    pipeline = MissingPatchPipeline(collector=mock_collector, scanner=scanner, detector=detector)
+
+    pipeline.run(
+        commit_url="https://example.com/commit/abc",
+        repo_url=str(repo_path),
+        local_path=str(repo_path),
+        include_local_branches=True,
+        max_workers=2,
+    )
+
+    assert scanner.worker_created is True
 
 def test_pipeline_all_missing(tmp_path: Path) -> None:
     """All branches unpatched → patched_branches is empty."""

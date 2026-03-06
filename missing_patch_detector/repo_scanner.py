@@ -26,8 +26,29 @@ class BranchFileSnapshot:
 class RepoScanner:
     """Initialize repositories, enumerate active branches, and read source files."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_blob_bytes: int = 5 * 1024 * 1024) -> None:
         self.repo: Repo | None = None
+        self.max_blob_bytes = max_blob_bytes
+
+    def clone_for_worker(self) -> "RepoScanner":
+        """Create a scanner instance for one worker thread.
+
+        Subclasses can override this to preserve custom constructor arguments
+        or runtime configuration while keeping per-thread scanner isolation.
+        """
+        try:
+            return type(self)(max_blob_bytes=self.max_blob_bytes)
+        except TypeError:
+            worker = type(self)()
+            if hasattr(worker, "max_blob_bytes"):
+                worker.max_blob_bytes = self.max_blob_bytes
+            return worker
+
+    def create_worker_scanner(self, repo_url: str, local_path: str) -> "RepoScanner":
+        """Build and initialize a thread-local scanner instance."""
+        worker = self.clone_for_worker()
+        worker.init_repo(repo_url, local_path)
+        return worker
 
     def init_repo(self, repo_url: str, local_path: str) -> Repo:
         repo_path = Path(local_path)
@@ -84,7 +105,7 @@ class RepoScanner:
         except (ValueError, GitCommandError, BadName) as exc:
             raise RepoScannerError(f"Failed to resolve branch {branch_name}: {exc}") from exc
 
-        source_code = self._read_blob_text(commit.tree, file_path)
+        source_code, too_large = self._read_blob_text(commit.tree, file_path)
         if source_code is not None:
             return BranchFileSnapshot(
                 branch=branch_name,
@@ -92,6 +113,15 @@ class RepoScanner:
                 resolved_path=file_path,
                 source_code=source_code,
                 status="found",
+            )
+
+        if too_large:
+            return BranchFileSnapshot(
+                branch=branch_name,
+                requested_path=file_path,
+                resolved_path=file_path,
+                source_code=None,
+                status="too_large",
             )
 
         resolved = self._best_effort_locate_in_tree(commit.tree, file_path)
@@ -108,7 +138,7 @@ class RepoScanner:
             branch=branch_name,
             requested_path=file_path,
             resolved_path=resolved,
-            source_code=self._read_blob_text(commit.tree, resolved),
+            source_code=self._read_blob_text(commit.tree, resolved)[0],
             status="renamed_or_moved",
         )
 
@@ -122,16 +152,22 @@ class RepoScanner:
         candidates.sort(key=lambda p: len(p.parts))
         return candidates[0]
 
-    def _read_blob_text(self, tree: Tree, file_path: str) -> str | None:
-        """Return UTF-8 text for *file_path* in *tree* when present."""
+    def _read_blob_text(self, tree: Tree, file_path: str) -> tuple[str | None, bool]:
+        """Return UTF-8 text for *file_path* in *tree* when present.
+
+        Returns a tuple of ``(content, too_large)`` where ``too_large`` indicates
+        the blob exists but exceeded ``max_blob_bytes`` and was skipped.
+        """
         try:
             obj = tree / file_path
         except KeyError:
-            return None
+            return None, False
 
         if not isinstance(obj, Blob):
-            return None
-        return obj.data_stream.read().decode("utf-8", errors="ignore")
+            return None, False
+        if obj.size > self.max_blob_bytes:
+            return None, True
+        return obj.data_stream.read().decode("utf-8", errors="ignore"), False
 
     def _best_effort_locate_in_tree(self, tree: Tree, original_path: str) -> str | None:
         """Fallback lookup for renamed/moved files by filename within one commit tree."""

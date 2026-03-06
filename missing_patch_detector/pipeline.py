@@ -35,6 +35,7 @@ class DetectionReport:
     patched_branches: list[str]
     missing_branches: list[str]
     branch_results: list[PatchPresenceResult] = field(default_factory=list)
+    scan_errors: dict[str, str] = field(default_factory=dict)
     cve_id: str | None = None
     commit_url: str | None = None
     generated_at: str = field(
@@ -61,7 +62,9 @@ class DetectionReport:
                 "patched_branches": self.patched_branches,
                 "missing_branches": self.missing_branches,
                 "total_branches_scanned": len(self.branch_results),
+                "scan_errors": len(self.scan_errors),
             },
+            "scan_errors": self.scan_errors,
             "branch_results": [
                 {
                     "branch": r.branch,
@@ -107,6 +110,7 @@ class DetectionReport:
         lines.append(f"| Branches scanned | {total} |")
         lines.append(f"| ✅ Patched | {patched_count} |")
         lines.append(f"| ❌ Missing patch | {missing_count} |")
+        lines.append(f"| ⚠️ Branch scan errors | {len(self.scan_errors)} |")
         lines.append("")
 
         lines.append("### Branch Results")
@@ -121,6 +125,13 @@ class DetectionReport:
                 f"| `{r.branch}` | {status} | {r.confidence:.2f} | {llm} | {missing} |"
             )
         lines.append("")
+
+        if self.scan_errors:
+            lines.append("### ⚠️ Branch Scan Errors")
+            lines.append("")
+            for branch, error in sorted(self.scan_errors.items()):
+                lines.append(f"- `{branch}`: {error}")
+            lines.append("")
 
         if self.missing_branches:
             lines.append("### ⚠️ Branches Missing the Patch")
@@ -230,13 +241,19 @@ class MissingPatchPipeline:
 
         # 4. Check each branch for patch presence
         branch_results: list[PatchPresenceResult] = []
+        scan_errors: dict[str, str] = {}
 
         if not branches:
             branch_results = []
         elif len(branches) == 1:
-            branch_results = [
-                self.detector.check_branch(diff_files, branches[0], self.scanner)
-            ]
+            branch = branches[0]
+            try:
+                branch_results = [
+                    self.detector.check_branch(diff_files, branch, self.scanner)
+                ]
+            except Exception as exc:
+                scan_errors[branch] = str(exc)
+                branch_results = [self._build_failed_branch_result(branch, diff_files)]
         else:
             worker_count = max_workers or min(32, len(branches))
             ordered_results: dict[str, PatchPresenceResult] = {}
@@ -252,8 +269,13 @@ class MissingPatchPipeline:
                     for branch in branches
                 }
                 for future in as_completed(futures):
-                    result = future.result()
-                    ordered_results[result.branch] = result
+                    branch = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        scan_errors[branch] = str(exc)
+                        result = self._build_failed_branch_result(branch, diff_files)
+                    ordered_results[branch] = result
 
             branch_results = [ordered_results[branch] for branch in branches]
 
@@ -264,6 +286,7 @@ class MissingPatchPipeline:
             patched_branches=patched,
             missing_branches=missing,
             branch_results=branch_results,
+            scan_errors=scan_errors,
             cve_id=cve_id,
             commit_url=commit_url,
         )
@@ -277,12 +300,24 @@ class MissingPatchPipeline:
         local_path: str,
     ) -> PatchPresenceResult:
         """Scan one branch using an isolated scanner instance for thread safety."""
-        if type(self.scanner) is RepoScanner:
-            worker_scanner = RepoScanner()
-            worker_scanner.init_repo(repo_url, local_path)
-            return self.detector.check_branch(diff_files, branch, worker_scanner)
+        worker_scanner = self.scanner.create_worker_scanner(repo_url, local_path)
+        return self.detector.check_branch(diff_files, branch, worker_scanner)
 
-        return self.detector.check_branch(diff_files, branch, self.scanner)
+    def _build_failed_branch_result(
+        self,
+        branch: str,
+        diff_files: list[DiffFileData],
+    ) -> PatchPresenceResult:
+        """Create a conservative result when a branch scan errors out."""
+        missing_files = [diff.file_path for diff in diff_files]
+        return PatchPresenceResult(
+            branch=branch,
+            patch_applied=False,
+            matched_files=[],
+            missing_files=missing_files,
+            confidence=0.0,
+            llm_assisted=False,
+        )
 
     def run_for_cve(
         self,

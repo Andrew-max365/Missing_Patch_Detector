@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  missing-patch-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: missing-patch-detector:latest
+    environment:
+      REPO_CACHE_DIR: ${REPO_CACHE_DIR:-/data/repos}
+      REPORT_DIR: ${REPORT_DIR:-/data/reports}
+      RUN_COMMAND: ${RUN_COMMAND:-python -c "print('Set RUN_COMMAND to your scan script')"}
+    volumes:
+      - ${HOST_REPO_CACHE_DIR:-./data/repos}:${REPO_CACHE_DIR:-/data/repos}
+      - ${HOST_REPORT_DIR:-./data/reports}:${REPORT_DIR:-/data/reports}
+    working_dir: /app
+    command: ["/bin/sh", "-lc", "${RUN_COMMAND}"]

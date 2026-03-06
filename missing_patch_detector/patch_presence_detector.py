@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import random
+import threading
+import time
 from typing import Callable
 
 from .patch_collector import DiffFileData
@@ -45,14 +48,26 @@ class PatchPresenceDetector:
         match_threshold: float = 0.8,
         llm_summarizer: Callable[[str], str] | None = None,
         llm_threshold: float = 0.5,
+        llm_max_concurrency: int = 2,
+        llm_max_retries: int = 3,
+        llm_initial_backoff: float = 0.5,
     ) -> None:
         if not (0.0 <= match_threshold <= 1.0):
             raise ValueError("match_threshold must be between 0.0 and 1.0")
         if not (0.0 <= llm_threshold <= 1.0):
             raise ValueError("llm_threshold must be between 0.0 and 1.0")
+        if llm_max_concurrency <= 0:
+            raise ValueError("llm_max_concurrency must be >= 1")
+        if llm_max_retries < 0:
+            raise ValueError("llm_max_retries must be >= 0")
+        if llm_initial_backoff <= 0:
+            raise ValueError("llm_initial_backoff must be > 0")
         self.match_threshold = match_threshold
         self.llm_summarizer = llm_summarizer
         self.llm_threshold = llm_threshold
+        self.llm_max_retries = llm_max_retries
+        self.llm_initial_backoff = llm_initial_backoff
+        self._llm_semaphore = threading.BoundedSemaphore(value=llm_max_concurrency)
 
     # ------------------------------------------------------------------
     # Per-file helpers
@@ -105,8 +120,26 @@ class PatchPresenceDetector:
             f"=== PATCH ===\n{diff_section}\n"
             f"=== SOURCE ===\n{source_section}"
         )
-        answer = self.llm_summarizer(prompt)
+        answer = self._call_llm_with_retry(prompt)
         return answer.strip().upper().startswith("YES")
+
+
+    def _call_llm_with_retry(self, prompt: str) -> str:
+        """Call LLM callback with concurrency throttling and retry backoff."""
+        assert self.llm_summarizer is not None
+
+        with self._llm_semaphore:
+            attempt = 0
+            while True:
+                try:
+                    return self.llm_summarizer(prompt)
+                except Exception:
+                    if attempt >= self.llm_max_retries:
+                        raise
+                    sleep_seconds = self.llm_initial_backoff * (2**attempt)
+                    sleep_seconds += random.uniform(0.0, 0.1)
+                    time.sleep(sleep_seconds)
+                    attempt += 1
 
     # ------------------------------------------------------------------
     # Branch-level check
