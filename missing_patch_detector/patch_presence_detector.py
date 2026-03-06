@@ -109,7 +109,8 @@ class PatchPresenceDetector:
             f"Added lines:\n" + "\n".join(diff_data.added_lines[:80]) + "\n"
             f"Removed lines:\n" + "\n".join(diff_data.removed_lines[:80]) + "\n"
         )
-        source_section = f"Current source:\n{source_code[:3000]}\n"
+        relevant_source = self._extract_relevant_source_window(diff_data, source_code)
+        source_section = f"Current source:\n{relevant_source}\n"
 
         prompt = (
             "You are a security patch analyst.\n"
@@ -122,6 +123,67 @@ class PatchPresenceDetector:
         )
         answer = self._call_llm_with_retry(prompt)
         return answer.strip().upper().startswith("YES")
+
+    def _extract_relevant_source_window(
+        self,
+        diff_data: DiffFileData,
+        source_code: str,
+        window_lines: int = 25,
+        max_chars: int = 6000,
+    ) -> str:
+        """Extract source regions around diff context lines for LLM analysis.
+
+        Uses context, added and removed lines as anchors to find relevant areas in
+        ``source_code`` and returns merged sliding windows around each hit.
+        Falls back to a bounded prefix if no anchor can be located.
+        """
+        source_lines = source_code.splitlines()
+        if not source_lines:
+            return ""
+
+        anchors = [
+            line.strip()
+            for line in [
+                *diff_data.context_lines,
+                *diff_data.added_lines,
+                *diff_data.removed_lines,
+            ]
+            if line.strip()
+        ]
+
+        matched_indexes: set[int] = set()
+        for idx, source_line in enumerate(source_lines):
+            stripped_source = source_line.strip()
+            if not stripped_source:
+                continue
+            if any(anchor in stripped_source for anchor in anchors):
+                matched_indexes.add(idx)
+
+        if not matched_indexes:
+            return source_code[:max_chars]
+
+        windows: list[tuple[int, int]] = []
+        for idx in sorted(matched_indexes):
+            start = max(0, idx - window_lines)
+            end = min(len(source_lines), idx + window_lines + 1)
+            if windows and start <= windows[-1][1]:
+                prev_start, prev_end = windows[-1]
+                windows[-1] = (prev_start, max(prev_end, end))
+            else:
+                windows.append((start, end))
+
+        snippets: list[str] = []
+        for start, end in windows:
+            snippet = "\n".join(source_lines[start:end])
+            snippets.append(
+                f"# Lines {start + 1}-{end} (matched diff context nearby)\n{snippet}"
+            )
+
+        combined = "\n\n...\n\n".join(snippets)
+        if len(combined) <= max_chars:
+            return combined
+
+        return combined[: max_chars - 15] + "\n\n...[truncated]"
 
 
     def _call_llm_with_retry(self, prompt: str) -> str:

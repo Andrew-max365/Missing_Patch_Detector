@@ -336,3 +336,72 @@ def test_llm_retry_on_transient_failure(tmp_path: Path) -> None:
     assert result.patch_applied is True
     assert result.llm_assisted is True
     assert attempts["count"] == 3
+
+
+def test_extract_relevant_source_window_prefers_context_near_patch() -> None:
+    filler = "\n".join([f"# filler {i}" for i in range(500)])
+    vulnerable_tail = "\n".join(
+        [
+            "def parse_size(size):",
+            "    # guard starts here",
+            "    if size < 0:",
+            "        raise ValueError(\"invalid size\")",
+            "    return int(size)",
+        ]
+    )
+    source = f"{filler}\n{vulnerable_tail}\n"
+
+    detector = PatchPresenceDetector()
+    snippet = detector._extract_relevant_source_window(DIFF_DATA, source)
+
+    assert "if size < 0:" in snippet
+    assert "raise ValueError(\"invalid size\")" in snippet
+    # Ensure we are no longer just feeding the start of file to the LLM.
+    assert "# filler 0" not in snippet
+
+
+def test_llm_prompt_includes_relevant_tail_context_not_prefix(tmp_path: Path) -> None:
+    repo_path = tmp_path / "repo"
+    repo = Repo.init(repo_path)
+    source = "\n".join(
+        [
+            *[f"# filler {i}" for i in range(700)],
+            "def parse_size(size):",
+            "    if size < 0:",
+            "        raise ValueError(\"invalid size\")",
+            "    return int(size)",
+        ]
+    )
+    (repo_path / "app.py").write_text(source + "\n", encoding="utf-8")
+    repo.index.add(["app.py"])
+    repo.index.commit("large source")
+
+    scanner = RepoScanner()
+    scanner.init_repo(str(repo_path), str(repo_path))
+
+    prompts_seen: list[str] = []
+
+    def fake_llm(prompt: str) -> str:
+        prompts_seen.append(prompt)
+        return "YES"
+
+    diff_for_llm = DiffFileData(
+        file_path="app.py",
+        source_file="a/app.py",
+        target_file="b/app.py",
+        removed_lines=[],
+        added_lines=["if size <= 0:", '    raise ValueError("invalid size")'],
+        context_lines=["def parse_size(size):", "    return int(size)"],
+    )
+
+    detector = PatchPresenceDetector(
+        match_threshold=1.0,
+        llm_summarizer=fake_llm,
+        llm_threshold=1.0,
+    )
+    detector.check_branch([diff_for_llm], "master", scanner)
+
+    assert len(prompts_seen) == 1
+    assert "if size < 0:" in prompts_seen[0]
+    assert "raise ValueError(\"invalid size\")" in prompts_seen[0]
+    assert "# filler 0" not in prompts_seen[0]
