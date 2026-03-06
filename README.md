@@ -2,14 +2,17 @@
 
 **Missing Patch Detector** 是一个用于自动扫描 Git 代码仓库及其所有活跃分支，检测特定安全补丁（CVE Fix）是否已被应用的自动化安全分析工具。
 
-该工具专为漏洞分析师和软件供应链安全工程师设计，完美解决**上游开源项目发布安全补丁后，下游项目（或同一个项目的多个历史长周期分支）漏打补丁**的痛点，极大提升补丁移植（Patch Backporting）的工作效率。
+该工具专为漏洞分析师和软件供应链安全工程师设计，解决上游开源项目发布安全补丁后，下游项目（或同一个项目的多个历史长周期分支）漏打补丁的痛点，极大提升补丁移植（Patch Backporting）的工作效率。
 
 ## ✨ 核心特性
 
-- 📥 **自动补丁采集**: 给定一个 GitHub/GitLab Commit URL，自动下载并精准解析对应的 unified diff 数据。
-- 🔍 **智能仓库扫描**: 自动过滤掉长期未活跃的僵尸分支（基于时间戳），自动在不同分支间切换，并拥有**文件路径回溯定位能力**（自动解决历史分支中文件被重命名或移动导致找不到文件的问题）。
-- ⚖️ **高容错代码比对**: 基于特征行匹配比例（Confidence Score）进行检测，避免由于空格、换行等细微差别导致的误报。
-- 🤖 **LLM-Ready 架构**: 预留了高度解耦的大模型（LLM）调用回调接口，为应对代码重构导致文本匹配失效时的“语义级漏洞检测”打下基础。
+- 🔗 **CVE 自动解析**: 只需输入 CVE ID，工具即可通过 OSV API 自动解析并获取对应的上游修复 Commit URL。
+- 📥 **自动补丁采集**: 给定 Commit URL 后，自动下载并精准解析对应的 unified diff 数据。
+- 🔍 **智能仓库扫描**: 自动过滤非活跃分支，并具备**文件路径回溯定位能力**（自动解决由于文件重命名或移动导致的检测失败问题）。
+- ⚖️ **高容错检测引擎**: 
+    - **文本比对**: 基于特征行匹配比例（Confidence Score）进行检测，规避空格和换行差异的影响。
+    - **LLM 语义判定**: 预留并初步实现了大模型（LLM）调用接口。当代码重构导致文本匹配率过低时，可自动请求 LLM 进行语义级漏洞检测判定。
+- 📊 **多格式报告输出**: 内置 Markdown 和 JSON 格式的审计报告导出能力，方便人工阅读或自动化系统集成。
 
 ## 📦 安装
 
@@ -29,7 +32,8 @@ pip install ".[test]"
 
 ## 🚀 快速开始
 
-使用 `MissingPatchPipeline` 可以通过几行代码实现从下载补丁到输出报告的完整流水线。
+### 场景一：基于 CVE ID 自动运行完整流水线
+这是最自动化的方式，系统会自动解析 CVE 修复地址并扫描目标仓库。
 
 ```python
 from missing_patch_detector import MissingPatchPipeline
@@ -37,46 +41,49 @@ from missing_patch_detector import MissingPatchPipeline
 # 初始化 Pipeline
 pipeline = MissingPatchPipeline()
 
-# 运行扫描
+# 运行扫描：自动根据 CVE 解析补丁并检查目标仓库分支
+reports = pipeline.run_for_cve(
+    cve_id="CVE-2021-44228",
+    repo_url="[https://github.com/example/log4j-fork](https://github.com/example/log4j-fork)",
+    local_path="/tmp/log4j-fork"
+)
+
+for report in reports:
+    print(report.to_markdown())
+```
+
+### 场景二：指定修复 Commit URL 进行扫描
+```python
+from missing_patch_detector import MissingPatchPipeline
+
+pipeline = MissingPatchPipeline()
 report = pipeline.run(
     commit_url="[https://github.com/torvalds/linux/commit/8c1f34d](https://github.com/torvalds/linux/commit/8c1f34d)", # 上游修复 Commit
     repo_url="[https://github.com/example/linux-fork](https://github.com/example/linux-fork)",              # 目标下游仓库
-    local_path="/tmp/linux-fork",                                  # 本地克隆路径
-    max_age_days=365,                                              # 仅扫描最近一年内有提交的活跃分支
-    include_local_branches=True
+    local_path="/tmp/linux-fork",                                  # 本地路径
+    max_age_days=365                                               # 仅扫描最近一年活跃分支
 )
 
 print(f"✅ 已打补丁的分支: {report.patched_branches}")
 print(f"❌ 遗漏补丁的分支: {report.missing_branches}")
-
-# 查看置信度等详细信息
-for res in report.branch_results:
-    print(f"分支: {res.branch} | 匹配度: {res.confidence:.2f} | 丢失文件: {res.missing_files}")
 ```
 
 ## 🏗️ 架构设计
 
 本项目采用高内聚、低耦合的模块化设计：
 
-- **`PatchCollector`**: 负责网络请求、`.patch` 文件下载及 diff 解析。提供 `generate_llm_signature` 用于生成语义特征。
-- **`RepoScanner`**: 包装了 `GitPython`，负责本地代码库的管理、分支的筛选以及文件源码的安全读取（包含 Best-effort Fallback 机制）。
-- **`PatchPresenceDetector`**: 核心决策引擎。负责计算差异补丁特征在新分支代码中的存活比例。
-- **`MissingPatchPipeline`**: 顶层调度器，将上述三大模块组合成自动化流水线，输出 `DetectionReport`。
+- **`CVEResolver`**: 负责将 CVE ID 通过 OSV API 映射为具体的 Git 修复提交信息。
+- **`PatchCollector`**: 负责补丁下载、diff 解析以及生成用于 LLM 判定的语义特征。
+- **`RepoScanner`**: 封装 `GitPython`，负责本地仓库管理、分支筛选及源代码检索（含 Fallback 回溯逻辑）。
+- **`PatchPresenceDetector`**: 核心决策引擎。负责计算补丁特征在目标代码中的存活比例，并支持 LLM 辅助决策。
+- **`MissingPatchPipeline`**: 顶层调度器，将上述模块组合成端到端的自动化扫描流水线。
 
 ## 🧪 测试
 
-项目包含完整的单元测试与集成测试，确保核心逻辑不受 Git 环境与网络的干扰。
+项目包含针对 CVE 解析、补丁采集、扫描逻辑及流水线的完整测试：
 
 ```bash
 pytest
 # 或查看详细输出
 pytest -v
 ```
-
-## 🗺️ Roadmap (开发计划)
-
-- [x] **Phase 1: 文本特征检测 (Text/Context Matching)** - 基于增量代码比例计算的静态匹配（当前版本）。
-- [ ] **Phase 2: LLM 语义检测 (Semantic Matching Fallback)** - 当代码特征匹配率不足时，自动将补丁特征与源码发送至大模型（如 Gemini / GPT-4）进行语义级判定。
-- [ ] **Phase 3: 自动化报告生成** - 内置 Markdown 与 JSON 格式的审计报告导出能力。
-- [ ] **Phase 4: AST 语法树特征支持** - 集成 `Tree-sitter`，提供比纯文本匹配更精确的抽象语法树级匹配。
-
