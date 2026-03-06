@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import random
 import threading
 import time
@@ -8,6 +9,8 @@ from typing import Callable
 
 from .patch_collector import DiffFileData
 from .repo_scanner import RepoScanner
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -42,6 +45,11 @@ class PatchPresenceDetector:
     ``str`` prompt and return ``"YES"`` or ``"NO"`` (case-insensitive) optionally
     followed by an explanation.
     """
+
+    # Minimum stripped length for a diff line to be used as an anchor when
+    # locating relevant source windows.  Lines shorter than this (e.g. ``}``,
+    # ``{``, ``return``) are too generic and would match throughout large files.
+    _MIN_ANCHOR_LENGTH: int = 4
 
     def __init__(
         self,
@@ -152,11 +160,12 @@ class PatchPresenceDetector:
         ]
 
         matched_indexes: set[int] = set()
+        anchor_set = {a for a in anchors if len(a) >= self._MIN_ANCHOR_LENGTH}
         for idx, source_line in enumerate(source_lines):
             stripped_source = source_line.strip()
             if not stripped_source:
                 continue
-            if any(anchor in stripped_source for anchor in anchors):
+            if stripped_source in anchor_set:
                 matched_indexes.add(idx)
 
         if not matched_indexes:
@@ -195,11 +204,18 @@ class PatchPresenceDetector:
             while True:
                 try:
                     return self.llm_summarizer(prompt)
-                except Exception:
+                except Exception as exc:
                     if attempt >= self.llm_max_retries:
                         raise
                     sleep_seconds = self.llm_initial_backoff * (2**attempt)
                     sleep_seconds += random.uniform(0.0, 0.1)
+                    logger.warning(
+                        "LLM call failed (attempt %d/%d): %s – retrying in %.2fs",
+                        attempt + 1,
+                        self.llm_max_retries,
+                        exc,
+                        sleep_seconds,
+                    )
                     time.sleep(sleep_seconds)
                     attempt += 1
 
