@@ -168,6 +168,59 @@ def test_pipeline_uses_injected_dependencies() -> None:
     assert report.missing_branches == []
 
 
+def test_pipeline_run_preserves_branch_order_with_parallel_scan() -> None:
+    """Parallel scan should keep branch_results aligned with branch enumeration order."""
+    mock_collector = MagicMock(spec=PatchCollector)
+    mock_scanner = MagicMock(spec=RepoScanner)
+    mock_detector = MagicMock(spec=PatchPresenceDetector)
+
+    diff = DiffFileData(
+        file_path="f.py",
+        source_file="a/f.py",
+        target_file="b/f.py",
+        removed_lines=[],
+        added_lines=["x = 1"],
+        context_lines=[],
+    )
+
+    ordered_branches = ["release/1.0", "release/2.0", "main"]
+    mock_collector.download_patch.return_value = "raw patch"
+    mock_collector.parse_diff.return_value = [diff]
+    mock_scanner.get_active_branches.return_value = ordered_branches
+
+    def _result_for_branch(
+        _diff_files: list[DiffFileData],
+        branch: str,
+        _scanner: RepoScanner,
+    ) -> PatchPresenceResult:
+        return PatchPresenceResult(
+            branch=branch,
+            patch_applied=branch != "release/1.0",
+            matched_files=["f.py"] if branch != "release/1.0" else [],
+            missing_files=[] if branch != "release/1.0" else ["f.py"],
+            confidence=1.0 if branch != "release/1.0" else 0.0,
+        )
+
+    mock_detector.check_branch.side_effect = _result_for_branch
+
+    pipeline = MissingPatchPipeline(
+        collector=mock_collector,
+        scanner=mock_scanner,
+        detector=mock_detector,
+    )
+
+    report = pipeline.run(
+        commit_url="https://example.com/commit/xyz",
+        repo_url="https://example.com/repo.git",
+        local_path="/tmp/repo",
+        max_workers=3,
+    )
+
+    assert [r.branch for r in report.branch_results] == ordered_branches
+    assert report.patched_branches == ["release/2.0", "main"]
+    assert report.missing_branches == ["release/1.0"]
+
+
 def test_pipeline_all_missing(tmp_path: Path) -> None:
     """All branches unpatched → patched_branches is empty."""
     repo_path = tmp_path / "repo"

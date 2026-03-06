@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
 from .cve_resolver import CommitRef, CVEResolver
-from .patch_collector import PatchCollector
+from .patch_collector import DiffFileData, PatchCollector
 from .patch_presence_detector import PatchPresenceDetector, PatchPresenceResult
 from .repo_scanner import RepoScanner
 
@@ -189,6 +190,7 @@ class MissingPatchPipeline:
         max_age_days: int = 365,
         include_local_branches: bool = True,
         cve_id: str | None = None,
+        max_workers: int | None = None,
     ) -> DetectionReport:
         """Run the full detection pipeline and return a :class:`DetectionReport`.
 
@@ -209,6 +211,9 @@ class MissingPatchPipeline:
             evaluated.
         cve_id:
             Optional CVE identifier to attach to the report for traceability.
+        max_workers:
+            Number of worker threads used for branch-level scanning. Defaults to
+            ``min(32, len(branches))`` when scanning multiple branches.
         """
         # 1. Download and parse the upstream patch
         patch_text = self.collector.download_patch(commit_url)
@@ -225,9 +230,32 @@ class MissingPatchPipeline:
 
         # 4. Check each branch for patch presence
         branch_results: list[PatchPresenceResult] = []
-        for branch in branches:
-            result = self.detector.check_branch(diff_files, branch, self.scanner)
-            branch_results.append(result)
+
+        if not branches:
+            branch_results = []
+        elif len(branches) == 1:
+            branch_results = [
+                self.detector.check_branch(diff_files, branches[0], self.scanner)
+            ]
+        else:
+            worker_count = max_workers or min(32, len(branches))
+            ordered_results: dict[str, PatchPresenceResult] = {}
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(
+                        self._scan_branch_with_isolated_scanner,
+                        diff_files,
+                        branch,
+                        repo_url,
+                        local_path,
+                    ): branch
+                    for branch in branches
+                }
+                for future in as_completed(futures):
+                    result = future.result()
+                    ordered_results[result.branch] = result
+
+            branch_results = [ordered_results[branch] for branch in branches]
 
         patched = [r.branch for r in branch_results if r.patch_applied]
         missing = [r.branch for r in branch_results if not r.patch_applied]
@@ -239,6 +267,22 @@ class MissingPatchPipeline:
             cve_id=cve_id,
             commit_url=commit_url,
         )
+
+
+    def _scan_branch_with_isolated_scanner(
+        self,
+        diff_files: list[DiffFileData],
+        branch: str,
+        repo_url: str,
+        local_path: str,
+    ) -> PatchPresenceResult:
+        """Scan one branch using an isolated scanner instance for thread safety."""
+        if type(self.scanner) is RepoScanner:
+            worker_scanner = RepoScanner()
+            worker_scanner.init_repo(repo_url, local_path)
+            return self.detector.check_branch(diff_files, branch, worker_scanner)
+
+        return self.detector.check_branch(diff_files, branch, self.scanner)
 
     def run_for_cve(
         self,
