@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ from .cve_resolver import CommitRef, CVEResolver
 from .patch_collector import DiffFileData, PatchCollector
 from .patch_presence_detector import PatchPresenceDetector, PatchPresenceResult
 from .repo_scanner import RepoScanner
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -227,10 +230,13 @@ class MissingPatchPipeline:
             ``min(32, len(branches))`` when scanning multiple branches.
         """
         # 1. Download and parse the upstream patch
+        logger.info("Downloading patch from %s", commit_url)
         patch_text = self.collector.download_patch(commit_url)
         diff_files = self.collector.parse_diff(patch_text)
+        logger.info("Patch parsed: %d file(s) touched", len(diff_files))
 
         # 2. Initialise (clone or reuse) the target repository
+        logger.info("Initialising repository %s at %s", repo_url, local_path)
         self.scanner.init_repo(repo_url, local_path)
 
         # 3. Enumerate active branches
@@ -238,6 +244,7 @@ class MissingPatchPipeline:
             max_age_days=max_age_days,
             include_local=include_local_branches,
         )
+        logger.info("Found %d active branch(es) to scan", len(branches))
 
         # 4. Check each branch for patch presence
         branch_results: list[PatchPresenceResult] = []
@@ -247,15 +254,22 @@ class MissingPatchPipeline:
             branch_results = []
         elif len(branches) == 1:
             branch = branches[0]
+            logger.info("Scanning branch: %s", branch)
             try:
                 branch_results = [
                     self.detector.check_branch(diff_files, branch, self.scanner)
                 ]
             except Exception as exc:
+                logger.warning("Error scanning branch %s: %s", branch, exc)
                 scan_errors[branch] = str(exc)
                 branch_results = [self._build_failed_branch_result(branch, diff_files)]
         else:
             worker_count = max_workers or min(32, len(branches))
+            logger.info(
+                "Scanning %d branches with %d worker thread(s)",
+                len(branches),
+                worker_count,
+            )
             ordered_results: dict[str, PatchPresenceResult] = {}
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {
@@ -272,7 +286,14 @@ class MissingPatchPipeline:
                     branch = futures[future]
                     try:
                         result = future.result()
+                        logger.info(
+                            "Branch %s scanned: patch_applied=%s confidence=%.2f",
+                            branch,
+                            result.patch_applied,
+                            result.confidence,
+                        )
                     except Exception as exc:
+                        logger.warning("Error scanning branch %s: %s", branch, exc)
                         scan_errors[branch] = str(exc)
                         result = self._build_failed_branch_result(branch, diff_files)
                     ordered_results[branch] = result
@@ -281,6 +302,12 @@ class MissingPatchPipeline:
 
         patched = [r.branch for r in branch_results if r.patch_applied]
         missing = [r.branch for r in branch_results if not r.patch_applied]
+        logger.info(
+            "Scan complete: %d patched, %d missing, %d error(s)",
+            len(patched),
+            len(missing),
+            len(scan_errors),
+        )
 
         return DetectionReport(
             patched_branches=patched,
@@ -300,6 +327,7 @@ class MissingPatchPipeline:
         local_path: str,
     ) -> PatchPresenceResult:
         """Scan one branch using an isolated scanner instance for thread safety."""
+        logger.info("Worker: scanning branch %s", branch)
         worker_scanner = self.scanner.create_worker_scanner(repo_url, local_path)
         return self.detector.check_branch(diff_files, branch, worker_scanner)
 
@@ -362,9 +390,11 @@ class MissingPatchPipeline:
             On any network failure contacting the OSV API.
         """
         commit_refs: list[CommitRef] = self.cve_resolver.resolve(cve_id)
+        logger.info("CVE %s resolved to %d fix commit(s)", cve_id, len(commit_refs))
         reports: list[DetectionReport] = []
 
         for ref in commit_refs:
+            logger.info("Running pipeline for fix commit: %s", ref.commit_url)
             report = self.run(
                 commit_url=ref.commit_url,
                 repo_url=repo_url,

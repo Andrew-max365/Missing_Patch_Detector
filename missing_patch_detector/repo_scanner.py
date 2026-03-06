@@ -134,11 +134,20 @@ class RepoScanner:
                 status="missing",
             )
 
+        content, too_large = self._read_blob_text(commit.tree, resolved)
+        if too_large:
+            return BranchFileSnapshot(
+                branch=branch_name,
+                requested_path=file_path,
+                resolved_path=resolved,
+                source_code=None,
+                status="too_large",
+            )
         return BranchFileSnapshot(
             branch=branch_name,
             requested_path=file_path,
             resolved_path=resolved,
-            source_code=self._read_blob_text(commit.tree, resolved)[0],
+            source_code=content,
             status="renamed_or_moved",
         )
 
