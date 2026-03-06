@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: missing-patch-detector
-Version: 0.1.0
-Summary: Tools to collect patches and scan git branches for missing security fixes
-Requires-Python: >=3.10
-Requires-Dist: requests>=2.31.0
-Requires-Dist: unidiff>=0.7.5
-Requires-Dist: GitPython>=3.1.40
