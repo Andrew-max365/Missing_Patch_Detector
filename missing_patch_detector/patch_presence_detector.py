@@ -234,8 +234,9 @@ class PatchPresenceDetector:
         Uses *scanner* to read each relevant file on the branch.  Files that
         cannot be located are treated as unpatched.
 
-        When a ``llm_summarizer`` was provided and text-matching confidence is
-        below ``llm_threshold``, the LLM is queried as a fallback for that file.
+        When a ``llm_summarizer`` was provided and text-matching confidence does
+        not reach ``match_threshold``, the LLM is queried as a fallback for that
+        file regardless of the ``llm_threshold`` setting.
         """
         matched_files: list[str] = []
         missing_files: list[str] = []
@@ -254,8 +255,8 @@ class PatchPresenceDetector:
                 diff_data, snapshot.source_code
             )
 
-            # LLM fallback: if text matching is inconclusive and a summarizer is available
-            if not applied and self.llm_summarizer is not None and confidence < self.llm_threshold:
+            # LLM fallback: consult the LLM whenever text matching fails
+            if not applied and self.llm_summarizer is not None:
                 applied = self._ask_llm_for_file(diff_data, snapshot.source_code)
                 llm_assisted = True
                 # Treat LLM confirmation as high-confidence
