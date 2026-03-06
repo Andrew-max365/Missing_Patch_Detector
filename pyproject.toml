@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "missing-patch-detector"
+version = "0.1.0"
+description = "Tools to collect patches and scan git branches for missing security fixes"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.31.0",
+  "unidiff>=0.7.5",
+  "GitPython>=3.1.40",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+addopts = "-q"
