@@ -11,7 +11,7 @@ SAMPLE_PATCH = """diff --git a/app.py b/app.py
 index 1111111..2222222 100644
 --- a/app.py
 +++ b/app.py
-@@ -1,3 +1,5 @@
+@@ -1,2 +1,4 @@
  def parse_size(size):
 +    if size < 0:
 +        raise ValueError(\"invalid size\")
@@ -25,7 +25,7 @@ def test_parse_diff_extracts_added_removed_context() -> None:
 
     assert len(result) == 1
     assert result[0].file_path == "app.py"
-    assert "if size < 0:" in result[0].added_lines
+    assert "    if size < 0:" in result[0].added_lines
     assert "def parse_size(size):" in result[0].context_lines
 
 
